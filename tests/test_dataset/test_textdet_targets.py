@@ -145,11 +145,19 @@ def test_gen_textsnake_targets(mock_show_feature):
     assert np.allclose(target_generator.resample_step, 4.0)
     assert np.allclose(target_generator.center_region_shrink_ratio, 0.3)
 
-    # test find_head_tail
+    # test find_head_tail for quadrangle
     polygon = np.array([[1.0, 1.0], [5.0, 1.0], [5.0, 3.0], [1.0, 3.0]])
     head_inds, tail_inds = target_generator.find_head_tail(polygon, 2.0)
     assert np.allclose(head_inds, [3, 0])
     assert np.allclose(tail_inds, [1, 2])
+
+    # test find_head_tail for polygon
+    polygon = np.array([[0., 10.], [3., 3.], [10., 0.], [17., 3.], [20., 10.],
+                        [15., 10.], [13.5, 6.5], [10., 5.], [6.5, 6.5],
+                        [5., 10.]])
+    head_inds, tail_inds = target_generator.find_head_tail(polygon, 2.0)
+    assert np.allclose(head_inds, [9, 0])
+    assert np.allclose(tail_inds, [4, 5])
 
     # test generate_text_region_mask
     img_size = (3, 10)
@@ -210,3 +218,27 @@ def test_gen_textsnake_targets(mock_show_feature):
     assert 'gt_sin_map' in output.keys()
     assert 'gt_cos_map' in output.keys()
     mock_show_feature.assert_called_once()
+
+
+def test_fcenet_generate_targets():
+    fourier_degree = 5
+    target_generator = textdet_targets.FCENetTargets(
+        fourier_degree=fourier_degree)
+
+    h, w, c = (64, 64, 3)
+    text_polys = [[np.array([0, 0, 10, 0, 10, 10, 0, 10])],
+                  [np.array([20, 0, 30, 0, 30, 10, 20, 10])]]
+    text_polys_ignore = [[np.array([0, 0, 15, 0, 15, 10, 0, 10])]]
+
+    results = {}
+    results['mask_fields'] = []
+    results['img_shape'] = (h, w, c)
+    results['gt_masks_ignore'] = PolygonMasks(text_polys_ignore, h, w)
+    results['gt_masks'] = PolygonMasks(text_polys, h, w)
+    results['gt_bboxes'] = np.array([[0, 0, 10, 10], [20, 0, 30, 10]])
+    results['gt_labels'] = np.array([0, 1])
+
+    target_generator.generate_targets(results)
+    assert 'p3_maps' in results.keys()
+    assert 'p4_maps' in results.keys()
+    assert 'p5_maps' in results.keys()

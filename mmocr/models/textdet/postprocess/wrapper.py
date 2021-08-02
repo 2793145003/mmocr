@@ -2,11 +2,13 @@ import cv2
 import numpy as np
 import pyclipper
 import torch
+from mmcv.ops import contour_expand, pixel_group
 from numpy.linalg import norm
 from shapely.geometry import Polygon
 from skimage.morphology import skeletonize
 
 from mmocr.core import points2boundary
+from mmocr.core.evaluation.utils import boundary_iou
 
 
 def filter_instance(area, confidence, min_area, min_confidence):
@@ -24,6 +26,8 @@ def decode(
         return db_decode(**kwargs)
     if decoding_type == 'textsnake':
         return textsnake_decode(**kwargs)
+    if decoding_type == 'fcenet':
+        return fcenet_decode(**kwargs)
 
     raise NotImplementedError
 
@@ -33,7 +37,6 @@ def pan_decode(preds,
                min_text_confidence=0.5,
                min_kernel_confidence=0.5,
                min_text_avg_confidence=0.85,
-               min_kernel_area=0,
                min_text_area=16):
     """Convert scores to quadrangles via post processing in PANet. This is
     partially adapted from https://github.com/WenmuZhou/PAN.pytorch.
@@ -44,13 +47,11 @@ def pan_decode(preds,
         min_text_confidence (float): The minimal text confidence.
         min_kernel_confidence (float): The minimal kernel confidence.
         min_text_avg_confidence (float): The minimal text average confidence.
-        min_kernel_area (int): The minimal text kernel area.
         min_text_area (int): The minimal text instance region area.
     Returns:
         boundaries: (list[list[float]]): The instance boundary and its
             instance confidence list.
     """
-    from .pan import assign_pixels, estimate_text_confidence, get_pixel_num
     preds[:2, :, :] = torch.sigmoid(preds[:2, :, :])
     preds = preds.detach().cpu().numpy()
 
@@ -61,28 +62,16 @@ def pan_decode(preds,
 
     region_num, labels = cv2.connectedComponents(
         kernel.astype(np.uint8), connectivity=4)
-    valid_kernel_inx = []
-    region_pixel_num = get_pixel_num(labels, region_num)
-
-    # from inx 1. 0: meaningless.
-    for region_idx in range(1, region_num):
-        if region_pixel_num[region_idx] < min_kernel_area:
-            continue
-        valid_kernel_inx.append(region_idx)
-
-    # assign pixels to valid kernels
-    assignment = assign_pixels(
-        text.astype(np.uint8), embeddings, labels, region_num, 0.8)
-    assignment = assignment.reshape(text.shape)
+    contours, _ = cv2.findContours((kernel * 255).astype(np.uint8),
+                                   cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+    kernel_contours = np.zeros(text.shape, dtype='uint8')
+    cv2.drawContours(kernel_contours, contours, -1, 255)
+    text_points = pixel_group(text_score, text, embeddings, labels,
+                              kernel_contours, region_num,
+                              min_text_avg_confidence)
 
     boundaries = []
-
-    # compute text avg confidence
-
-    text_points = estimate_text_confidence(assignment, text_score, region_num)
-    for text_inx, text_point in text_points.items():
-        if text_inx not in valid_kernel_inx:
-            continue
+    for text_inx, text_point in enumerate(text_points):
         text_confidence = text_point[0]
         text_point = text_point[2:]
         text_point = np.array(text_point, dtype=int).reshape(-1, 2)
@@ -130,17 +119,16 @@ def pse_decode(preds,
     score = score.data.cpu().numpy().astype(np.float32)  # to numpy
 
     kernel_masks = kernel_masks.data.cpu().numpy().astype(np.uint8)  # to numpy
-    from .pse import pse
 
     region_num, labels = cv2.connectedComponents(
         kernel_masks[-1], connectivity=4)
 
     # labels = pse(kernel_masks, min_kernel_area)
-    labels = pse(kernel_masks, min_kernel_area, labels, region_num)
+    labels = contour_expand(kernel_masks, labels, min_kernel_area, region_num)
     labels = np.array(labels)
-    label_num = np.max(labels) + 1
+    label_num = np.max(labels)
     boundaries = []
-    for i in range(1, label_num):
+    for i in range(1, label_num + 1):
         points = np.array(np.where(labels == i)).transpose((1, 0))[:, ::-1]
         area = points.shape[0]
         score_instance = np.mean(score[labels == i])
@@ -262,7 +250,7 @@ def centralize(points_yx,
     while np.any(step_flags):
         next_yx = np.array(top_yx + step, dtype=np.int32)
         next_y, next_x = next_yx[:, 0], next_yx[:, 1]
-        step_flags = (0 <= next_y) & (next_y < h) & (0 < next_x) & (
+        step_flags = (next_y >= 0) & (next_y < h) & (next_x > 0) & (
             next_x < w) & contour_mask[np.clip(next_y, 0, h - 1),
                                        np.clip(next_x, 0, w - 1)]
         top_yx = top_yx + step_flags.reshape((-1, 1)) * step
@@ -270,7 +258,7 @@ def centralize(points_yx,
     while np.any(step_flags):
         next_yx = np.array(bot_yx - step, dtype=np.int32)
         next_y, next_x = next_yx[:, 0], next_yx[:, 1]
-        step_flags = (0 <= next_y) & (next_y < h) & (0 < next_x) & (
+        step_flags = (next_y >= 0) & (next_y < h) & (next_x > 0) & (
             next_x < w) & contour_mask[np.clip(next_y, 0, h - 1),
                                        np.clip(next_x, 0, w - 1)]
         bot_yx = bot_yx - step_flags.reshape((-1, 1)) * step
@@ -289,22 +277,21 @@ def merge_disks(disks, disk_overlap_thr):
         if order.size == 1:
             merged_disks.append(disks[order])
             break
+        i = order[0]
+        d = norm(xy[i] - xy[order[1:]], axis=1)
+        ri = radius[i]
+        r = radius[order[1:]]
+        d_thr = (ri + r) * disk_overlap_thr
+
+        merge_inds = np.where(d <= d_thr)[0] + 1
+        if merge_inds.size > 0:
+            merge_order = np.hstack([i, order[merge_inds]])
+            merged_disks.append(np.mean(disks[merge_order], axis=0))
         else:
-            i = order[0]
-            d = norm(xy[i] - xy[order[1:]], axis=1)
-            ri = radius[i]
-            r = radius[order[1:]]
-            d_thr = (ri + r) * disk_overlap_thr
+            merged_disks.append(disks[i])
 
-            merge_inds = np.where(d <= d_thr)[0] + 1
-            if merge_inds.size > 0:
-                merge_order = np.hstack([i, order[merge_inds]])
-                merged_disks.append(np.mean(disks[merge_order], axis=0))
-            else:
-                merged_disks.append(disks[i])
-
-            inds = np.where(d > d_thr)[0] + 1
-            order = order[inds]
+        inds = np.where(d > d_thr)[0] + 1
+        order = order[inds]
     merged_disks = np.vstack(merged_disks)
 
     return merged_disks
@@ -392,3 +379,177 @@ def textsnake_decode(preds,
             boundaries.append(boundary + [score])
 
     return boundaries
+
+
+def fcenet_decode(
+    preds,
+    fourier_degree,
+    reconstr_points,
+    scale,
+    alpha=1.0,
+    beta=2.0,
+    text_repr_type='poly',
+    score_thresh=0.8,
+    nms_thresh=0.1,
+):
+    """Decoding predictions of FCENet to instances.
+
+    Args:
+        preds (list(Tensor)): The head output tensors.
+        fourier_degree (int): The maximum Fourier transform degree k.
+        reconstr_points (int): The points number of the polygon reconstructed
+            from predicted Fourier coefficients.
+        scale (int): The downsample scale of the prediction.
+        alpha (float) : The parameter to calculate final scores. Score_{final}
+                = (Score_{text region} ^ alpha)
+                * (Score_{text center region}^ beta)
+        beta (float) : The parameter to calculate final score.
+        text_repr_type (str):  Boundary encoding type 'poly' or 'quad'.
+        score_thresh (float) : The threshold used to filter out the final
+            candidates.
+        nms_thresh (float) :  The threshold of nms.
+
+    Returns:
+        boundaries (list[list[float]]): The instance boundary and confidence
+            list.
+    """
+    assert isinstance(preds, list)
+    assert len(preds) == 2
+    assert text_repr_type == 'poly'
+
+    cls_pred = preds[0][0]
+    tr_pred = cls_pred[0:2].softmax(dim=0).data.cpu().numpy()
+    tcl_pred = cls_pred[2:].softmax(dim=0).data.cpu().numpy()
+
+    reg_pred = preds[1][0].permute(1, 2, 0).data.cpu().numpy()
+    x_pred = reg_pred[:, :, :2 * fourier_degree + 1]
+    y_pred = reg_pred[:, :, 2 * fourier_degree + 1:]
+
+    score_pred = (tr_pred[1]**alpha) * (tcl_pred[1]**beta)
+    tr_pred_mask = (score_pred) > score_thresh
+    tr_mask = fill_hole(tr_pred_mask)
+
+    tr_contours, _ = cv2.findContours(
+        tr_mask.astype(np.uint8), cv2.RETR_TREE,
+        cv2.CHAIN_APPROX_SIMPLE)  # opencv4
+
+    mask = np.zeros_like(tr_mask)
+    exp_matrix = generate_exp_matrix(reconstr_points, fourier_degree)
+    boundaries = []
+    for cont in tr_contours:
+        deal_map = mask.copy().astype(np.int8)
+        cv2.drawContours(deal_map, [cont], -1, 1, -1)
+
+        text_map = score_pred * deal_map
+        polygons = contour_transfor_inv(fourier_degree, x_pred, y_pred,
+                                        text_map, exp_matrix, scale)
+        polygons = poly_nms(polygons, nms_thresh)
+        boundaries = boundaries + polygons
+
+    boundaries = poly_nms(boundaries, nms_thresh)
+    return boundaries
+
+
+def poly_nms(polygons, threshold):
+    assert isinstance(polygons, list)
+
+    polygons = np.array(sorted(polygons, key=lambda x: x[-1]))
+
+    keep_poly = []
+    index = [i for i in range(polygons.shape[0])]
+
+    while len(index) > 0:
+        keep_poly.append(polygons[index[-1]].tolist())
+        A = polygons[index[-1]][:-1]
+        index = np.delete(index, -1)
+
+        iou_list = np.zeros((len(index), ))
+        for i in range(len(index)):
+            B = polygons[index[i]][:-1]
+
+            iou_list[i] = boundary_iou(A, B)
+        remove_index = np.where(iou_list > threshold)
+        index = np.delete(index, remove_index)
+
+    return keep_poly
+
+
+def contour_transfor_inv(fourier_degree, x_pred, y_pred, score_map, exp_matrix,
+                         scale):
+    """Reconstruct polygon from predicts.
+
+    Args:
+        fourier_degree (int): The maximum Fourier degree K.
+        x_pred (ndarray): The real part of predicted Fourier coefficients.
+        y_pred (ndarray): The image part of predicted Fourier coefficients.
+        score_map (ndarray): The final score of candidates.
+        exp_matrix (ndarray): A matrix of e^x, where x = 2pi x ikt, and shape
+            is (2k+1, n') where n' is reconstructed point number. See Eq.2
+            in paper.
+        scale (int): The down-sample scale.
+    Returns:
+        Polygons (list): The reconstructed polygons and scores.
+    """
+    mask = score_map > 0
+
+    xy_text = np.argwhere(mask)
+    dxy = xy_text[:, 1] + xy_text[:, 0] * 1j
+
+    x = x_pred[mask]
+    y = y_pred[mask]
+
+    c = x + y * 1j
+    c[:, fourier_degree] = c[:, fourier_degree] + dxy
+    c *= scale
+
+    polygons = fourier_inverse_matrix(c, exp_matrix=exp_matrix)
+    score = score_map[mask].reshape(-1, 1)
+    return np.hstack((polygons, score)).tolist()
+
+
+def fourier_inverse_matrix(fourier_coeff, exp_matrix):
+    """ Inverse Fourier transform
+    Args:
+        fourier_coeff (ndarray): Fourier coefficients shaped (n, 2k+1), with
+            n and k being candidates number and Fourier degree respectively.
+        exp_matrix (ndarray): A matrix of e^x, where x = 2pi x ikt and shape
+            is (2k+1, n') where n' is reconstructed point number.
+            See Eq.2 in paper.
+    Returns:
+        Polygons (ndarray): The reconstructed polygons shaped (n, n')
+    """
+
+    assert type(fourier_coeff) == np.ndarray
+    assert fourier_coeff.shape[1] == exp_matrix.shape[0]
+
+    n = exp_matrix.shape[1]
+    polygons = np.zeros((fourier_coeff.shape[0], n, 2))
+
+    points = np.matmul(fourier_coeff, exp_matrix)
+    p_x = np.real(points)
+    p_y = np.imag(points)
+    polygons[:, :, 0] = p_x
+    polygons[:, :, 1] = p_y
+    return polygons.astype('int32').reshape(polygons.shape[0], -1)
+
+
+def generate_exp_matrix(point_num, fourier_degree):
+    """ Generate a matrix of e^x, where x = 2pi x ikt. See Eq.2 in paper.
+        Args:
+            point_num (int): Number of reconstruct points of polygon
+            fourier_degree (int): Maximum Fourier degree k
+        Returns:
+            exp_matrix (ndarray): A matrix of e^x, where x = 2pi x ikt and
+            shape is (2k+1, n') where n' is reconstructed point number.
+    """
+    e = complex(np.e)
+    exp_matrix = np.zeros([2 * fourier_degree + 1, point_num], dtype='complex')
+
+    temp = np.zeros([point_num], dtype='complex')
+    for i in range(point_num):
+        temp[i] = 2 * np.pi * 1j / point_num * i
+
+    for i in range(2 * fourier_degree + 1):
+        exp_matrix[i, :] = temp * (i - fourier_degree)
+
+    return np.power(e, exp_matrix)
